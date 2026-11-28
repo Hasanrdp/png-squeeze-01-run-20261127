@@ -1,4 +1,4 @@
-// SqueezeShot — a lossless PNG re-encoder for make.fun's png-squeeze-01-run-20261127.
+// SqueezeShot v2 — a lossless PNG re-encoder for make.fun's png-squeeze-01-run-20261127.
 //
 // One program answers a whole set: it reads each /input/<id>/image.png (a stored
 // RGBA screenshot, 1280x720), and writes the same pixels back as the smallest PNG
@@ -15,16 +15,21 @@
 //     force that weighs each filter by a real level-4 deflate of the row against
 //     the 32 KiB written before it. Each candidate is weighed by a level-6 zlib
 //     run of its filtered bytes plus its PLTE/tRNS chunk cost.
-//   * Deflate last. The winning filtered stream is re-compressed at level 9
-//     (default and filtered strategies), and, when it wins, by the optimal-parse
-//     encoder in optdeflate.mjs. The smaller stream is the one shipped.
+//   * Deflate last. The winning filtered stream is re-compressed four ways and
+//     the smallest ships: zlib level 9 (default and filtered strategies), zlib
+//     level 9 with the stream split into fresh-Huffman blocks at row
+//     boundaries, and the optimal-parse encoder in deflate.mjs (3-byte hash
+//     chains with structural row/run candidates, an exact-bit shortest-path
+//     parse in three refinement passes, and token-level block splitting).
+//     Every non-zlib candidate is verified by inflating it back before it
+//     is trusted.
 //
 // Everything is deterministic: no clock, no randomness, no environment input.
 // Node 22 runs this file as node /bot/main.ts; it uses only node: built-ins.
-import { inflateSync, deflateSync, constants } from 'node:zlib';
+import { inflateSync, deflateSync, createDeflate, constants } from 'node:zlib';
 import { mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { optimalDeflate } from './optdeflate.mjs';
+import { optimalDeflate2 } from './deflate.mjs';
 
 const IN_DIR = process.env.MAKEFUN_INPUT_DIR ?? '/input';
 const OUT_DIR = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
@@ -524,27 +529,72 @@ function extraChunks(form) {
   return (form.plte === null ? 0 : 12 + form.plte.length) + (form.trns === null ? 0 : 12 + form.trns.length);
 }
 
+/** True when `stream` inflates back to exactly `raw` (a zlib stream, header and Adler included). */
+function roundTrips(stream, raw) {
+  try {
+    const back = inflateSync(stream, { maxOutputLength: raw.length + 1 });
+    return back.length === raw.length && back.every((b, i) => b === raw[i]);
+  } catch {
+    return false;
+  }
+}
+
 /**
- * The smallest zlib stream of `raw`: level 9, default and filtered strategy,
- * and the optimal-parse encoder when it wins. The optimal encoder is only
- * run on small streams (grey / palette forms, under 2 MB): on full RGBA
- * streams it costs most of the wall budget and never beat level 9 on the
- * practice set, while on the small forms it is cheap and sometimes wins.
- * Deterministic throughout.
+ * zlib level 9 of `raw` with the stream split into fresh-Huffman blocks
+ * every `rowsPerBlock` rows: each block boundary is a Z_BLOCK flush, so the
+ * block gets Huffman tables fitted to its own rows while the LZ77 window
+ * carries over. The split points are fixed row counts, so the bytes are
+ * deterministic. Returns null on any error.
  */
-function compressBest(raw) {
+function z9split(raw, rowLen, rowsPerBlock) {
+  return new Promise((resolve) => {
+    const d = createDeflate({ level: 9, memLevel: 9 });
+    const chunks = [];
+    d.on('data', (c) => chunks.push(c));
+    d.on('error', () => resolve(null));
+    d.on('end', () => resolve(Buffer.concat(chunks)));
+    const rows = Math.floor(raw.length / rowLen);
+    let i = 0;
+    const step = () => {
+      if (i >= rows) { d.end(); return; }
+      const n = Math.min(rowsPerBlock, rows - i);
+      const end = i + n;
+      const more = end < rows;
+      d.write(raw.subarray(i * rowLen, end * rowLen), () => {
+        i = end;
+        if (more) d.flush(constants.Z_BLOCK, step);
+        else step();
+      });
+    };
+    step();
+  });
+}
+
+/**
+ * The smallest zlib stream of `raw`: level 9 (default and filtered
+ * strategies), level 9 with block splits at row boundaries, and the
+ * optimal-parse encoder. The optimal encoder runs on every stream now:
+ * it beats level 9 on the practice set at every size, and its block
+ * splitting adapts the Huffman tables to the image's regions. Every
+ * candidate that is not zlib's own output is inflated back and only
+ * trusted when it reproduces `raw` exactly. Deterministic throughout:
+ * fixed split points, fixed iteration counts, no clock.
+ */
+async function compressBest(raw, rowLen) {
   let best = deflateSync(raw, { level: 9, memLevel: 9 });
   const filtered = deflateSync(raw, { level: 9, memLevel: 9, strategy: constants.Z_FILTERED });
   if (filtered.length < best.length) best = filtered;
-  if (raw.length <= 2000000) {
-    const optimal = optimalDeflate(raw);
-    if (optimal !== null && optimal.length < best.length) best = optimal;
+  for (const rowsPerBlock of [64, 128]) {
+    const split = await z9split(raw, rowLen, rowsPerBlock);
+    if (split !== null && split.length < best.length && roundTrips(split, raw)) best = split;
   }
+  const optimal = optimalDeflate2(raw, rowLen);
+  if (optimal !== null && optimal.length < best.length && roundTrips(optimal, raw)) best = optimal;
   return new Uint8Array(best.buffer, best.byteOffset, best.length);
 }
 
 /** The squeezed PNG of one RGBA image: the best form and filter choice, deflated best. */
-function squeeze(rgba, width, height) {
+async function squeeze(rgba, width, height) {
   let best = null;
   for (const form of formsOf(rgba)) {
     const chunks = extraChunks(form);
@@ -555,7 +605,8 @@ function squeeze(rgba, width, height) {
       if (best === null || bytes < best.bytes) best = { form, data, bytes };
     }
   }
-  const idat = compressBest(best.data);
+  const rowLen = width * best.form.bpp + 1;
+  const idat = await compressBest(best.data, rowLen);
   const chunks = [['IHDR', ihdrData(width, height, best.form.colourType)]];
   if (best.form.plte !== null) chunks.push(['PLTE', best.form.plte]);
   if (best.form.trns !== null) chunks.push(['tRNS', best.form.trns]);
@@ -568,5 +619,5 @@ for (const id of readdirSync(IN_DIR).sort()) {
   const image = decodePng(new Uint8Array(readFileSync(join(IN_DIR, id, 'image.png'))));
   if (image.width !== 1280 || image.height !== 720) throw new Error(`${id} is ${image.width}x${image.height}, not 1280x720`);
   mkdirSync(join(OUT_DIR, id), { recursive: true });
-  writeFileSync(join(OUT_DIR, id, 'image.png'), squeeze(image.rgba, image.width, image.height));
+  writeFileSync(join(OUT_DIR, id, 'image.png'), await squeeze(image.rgba, image.width, image.height));
 }
